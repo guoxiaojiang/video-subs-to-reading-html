@@ -72,6 +72,7 @@ cmd_build() {
   done
 
   local vid; vid=$(video_id_of "$url")
+  local title; title=$(yt-dlp --no-update --print title "$url" | head -1)
   local out_dir="$BASE_DIR/$vid"
   mkdir -p "$out_dir"
 
@@ -96,7 +97,7 @@ cmd_build() {
     exit 2
   fi
 
-  python3 - <<'PY' "$src_vtt" "$tgt_vtt" "$output" "$url" "$src_lang" "$tgt_lang" "$out_dir" "$vid" "$KEEP_INTERMEDIATE"
+  python3 - <<'PY' "$src_vtt" "$tgt_vtt" "$output" "$url" "$src_lang" "$tgt_lang" "$out_dir" "$vid" "$KEEP_INTERMEDIATE" "$title"
 import re, html, sys
 from pathlib import Path
 
@@ -109,6 +110,7 @@ tgt_lang = sys.argv[6]
 out_dir = Path(sys.argv[7])
 vid     = sys.argv[8]
 keep_intermediate = sys.argv[9] == '1'
+title   = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else vid
 
 cue_re = re.compile(r'^(\d\d:\d\d:\d\d\.\d+) --> (\d\d:\d\d:\d\d\.\d+)')
 tag_re = re.compile(r'<[^>]+>')
@@ -304,26 +306,21 @@ html_doc = f'''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{html.escape(vid)} — {html.escape(lang_title)}</title>
+<title>{html.escape(title)}</title>
 <style>{css}</style>
 </head>
 <body>
 <main>
   <header>
     <div class="header-card">
-      <div class="kicker">Reading Transcript</div>
-      <h1>{html.escape(vid)}</h1>
-      <p class="subtitle">{html.escape(lang_title)}</p>
+      <h1>{html.escape(title)}</h1>
       <div class="meta">
         <span>Video: <a href="{url}">{url}</a></span>
         <span>Segments: {len(merged)}</span>
-        <span>Source: YouTube auto captions</span>
       </div>
-      <div class="note">这是为阅读重排过的版本：已合并过碎字幕块、去除部分重复。若启用了双语，会按时间轴对齐。自动字幕与自动翻译可能存在专有名词、断句和标点误差。</div>
     </div>
   </header>
   <div class="section-list">{''.join(parts)}</div>
-  <footer>Clean editorial layout. No glossy / "AI aesthetic" treatment.</footer>
 </main>
 </body>
 </html>'''
