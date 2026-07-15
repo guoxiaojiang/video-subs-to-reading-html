@@ -144,6 +144,19 @@ def parse_vtt(path: Path):
         i += 1
     return cues
 
+def word_overlap(prev, cur, max_k=20):
+    # 返回 cur 开头与 prev 结尾重复的词数，用于消除 YouTube 自动字幕滚动上下文
+    if not prev or not cur:
+        return 0
+    if cur == prev or prev.endswith(cur):
+        return len(cur.split(' '))
+    wp, wc = prev.split(' '), cur.split(' ')
+    best = 0
+    for k in range(1, min(len(wp), len(wc), max_k)+1):
+        if wp[-k:] == wc[:k]:
+            best = k
+    return best
+
 def merge_text(prev, cur):
     prev, cur = norm(prev), norm(cur)
     if not prev: return cur
@@ -151,13 +164,25 @@ def merge_text(prev, cur):
     if cur == prev: return prev
     if cur.startswith(prev): return cur
     if prev.endswith(cur): return prev
-    wp, wc = prev.split(' '), cur.split(' ')
-    overlap = 0
-    for k in range(1, min(len(wp), len(wc), 12)+1):
-        if wp[-k:] == wc[:k]: overlap = k
-    if overlap:
-        return prev + ' ' + ' '.join(wc[overlap:])
+    wc = cur.split(' ')
+    k = word_overlap(prev, cur)
+    if k:
+        return prev + ' ' + ' '.join(wc[k:])
     return prev + ' ' + cur
+
+def strip_leading_overlap(prev, cur, min_k=2):
+    # 分段起始时，从 cur 头部剥掉与 prev 尾部重复的滚动字幕
+    # 要求至少 min_k 个词才认为是重叠，避免单词偶然重合被误剥
+    prev, cur = norm(prev), norm(cur)
+    if not prev or not cur:
+        return cur
+    wc = cur.split(' ')
+    k = word_overlap(prev, cur)
+    if k < min_k:
+        return cur
+    if k >= len(wc):
+        return ''
+    return ' '.join(wc[k:])
 
 def is_end(s):
     return bool(re.search(r'[.!?。！？]$' , s.strip()))
@@ -197,7 +222,10 @@ for start, end, st, tt in pairs:
     cand_tgt = merge_text(cur[3], tt)
     if len(cand_src) > 260 and is_end(cur[2]):
         merged.append(tuple(cur))
-        cur = [start, end, st, tt]
+        # 新段起始时剥掉与上一段尾部重复的词，避免 YouTube 滚动字幕造成的重复开头
+        new_st = strip_leading_overlap(cur[2], st)
+        new_tt = strip_leading_overlap(cur[3], tt) if tt else tt
+        cur = [start, end, new_st, new_tt]
     else:
         cur[1] = end
         cur[2] = cand_src
@@ -213,6 +241,22 @@ for item in merged:
     else:
         post.append(item)
 merged = post
+
+# 二次清理：连续两段之间若仍有词级重叠（跨越合并阈值边界的场景），从后段头部剥离
+cleaned = []
+for item in merged:
+    if cleaned:
+        prev = cleaned[-1]
+        new_src = strip_leading_overlap(prev[2], item[2])
+        new_tgt = strip_leading_overlap(prev[3], item[3]) if item[3] else item[3]
+        if new_src.strip():
+            cleaned.append((item[0], item[1], new_src, new_tgt))
+        else:
+            # 全部是重复内容，合并回上一段
+            cleaned[-1] = (prev[0], item[1], prev[2], prev[3])
+    else:
+        cleaned.append(item)
+merged = cleaned
 
 lang_title = f"{src_lang} transcript" if not tgt_lang else f"{src_lang} / {tgt_lang} reading transcript"
 css = '''
