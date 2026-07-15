@@ -1,0 +1,18 @@
+.DS_Store
+*.swp
+*.swo
+
+# 中间产物
+*.vtt
+*.srt
+*.ttml
+*.srv1
+*.srv2
+*.srv3
+*.json3
+*.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
