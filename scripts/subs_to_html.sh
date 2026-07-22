@@ -1,38 +1,25 @@
 #!/usr/bin/env bash
-# video-subs-to-reading-html — 从 YouTube 视频字幕生成适合阅读的 HTML
+# video-subs-to-reading-html — 两阶段流程：
+#   1) prepare : 仅拉取英文字幕，合并成阅读段，输出 segments.json
+#   2) (agent) : 由调用方 Agent 阅读整篇后为每段填 zh（信达雅）
+#   3) render  : 读取 segments.json，渲染中英对照阅读版 HTML
 #
-# 依赖: yt-dlp, python3
-# Python 标准库即可，无额外依赖
+# 依赖: yt-dlp, python3（标准库即可）
 #
-# 用法:
-#   1) 查看可用字幕:
-#      ./subs_to_html.sh list <youtube_url>
+# 用法：
+#   ./subs_to_html.sh list    <youtube_url>
+#   ./subs_to_html.sh prepare <youtube_url> [-o segments.json]
+#   ./subs_to_html.sh render  <segments.json> [-o output.html]
+#   ./subs_to_html.sh clean   [<video_id>]
 #
-#   2) 生成阅读版 HTML:
-#      ./subs_to_html.sh build <youtube_url> [选项]
-#        --lang en                    仅导出单语 (默认 en)
-#        --bilingual zh-Hans          生成双语对照 (例如 zh-Hans / zh-Hant / ja / ko ...)
-#        -o FILE                      输出 HTML 路径
-#        --keep-intermediate          保留中间 .vtt / .md / .txt 文件
-#
-#   3) 清理:
-#      ./subs_to_html.sh clean [video_id]
-#
-# 输出默认目录:
-#   ~/Downloads/subtitles_extract/<video_id>/<video_id>.reading.html
+# 默认输出目录：
+#   ~/Downloads/subtitles_extract/<video_id>/
+#     ├── <video_id>.segments.json
+#     └── <video_id>.reading.html
 
 set -euo pipefail
 
 BASE_DIR="$HOME/Downloads/subtitles_extract"
-WORKDIR=""
-KEEP_INTERMEDIATE=0
-
-cleanup() {
-  if [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]]; then
-    rm -rf "$WORKDIR"
-  fi
-}
-trap cleanup EXIT
 
 check_deps() {
   for cmd in yt-dlp python3; do
@@ -41,8 +28,7 @@ check_deps() {
 }
 
 video_id_of() {
-  local url="$1"
-  yt-dlp --no-update --print id "$url" | head -1
+  yt-dlp --no-update --print id "$1" | head -1
 }
 
 cmd_list() {
@@ -51,66 +37,49 @@ cmd_list() {
   yt-dlp --no-update --list-subs "$url"
 }
 
-cmd_build() {
+cmd_prepare() {
   local url="${1:-}"
-  [[ -z "$url" ]] && { echo "用法: $0 build <youtube_url> [选项]" >&2; exit 1; }
+  [[ -z "$url" ]] && { echo "用法: $0 prepare <youtube_url> [-o segments.json]" >&2; exit 1; }
   shift || true
 
-  local src_lang="en"
-  local tgt_lang=""
   local output=""
-
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --lang)               src_lang="$2"; shift 2 ;;
-      --bilingual)          tgt_lang="$2"; shift 2 ;;
-      -o|--output)          output="$2"; shift 2 ;;
-      --keep-intermediate)  KEEP_INTERMEDIATE=1; shift ;;
-      -*)                   echo "未知参数: $1" >&2; exit 1 ;;
-      *)                    echo "未知参数或多余输入: $1" >&2; exit 1 ;;
+      -o|--output) output="$2"; shift 2 ;;
+      -*) echo "未知参数: $1" >&2; exit 1 ;;
+      *)  echo "未知参数: $1" >&2; exit 1 ;;
     esac
   done
 
-  local vid; vid=$(video_id_of "$url")
-  local title; title=$(yt-dlp --no-update --print title "$url" | head -1)
+  local vid title
+  vid=$(video_id_of "$url")
+  title=$(yt-dlp --no-update --print title "$url" | head -1)
   local out_dir="$BASE_DIR/$vid"
   mkdir -p "$out_dir"
+  [[ -z "$output" ]] && output="$out_dir/$vid.segments.json"
 
-  if [[ -z "$output" ]]; then
-    output="$out_dir/$vid.reading.html"
-  fi
-
-  local langs="$src_lang"
-  if [[ -n "$tgt_lang" ]]; then langs="$src_lang,$tgt_lang"; fi
-
-  echo "==> 下载字幕轨道: $langs" >&2
-  yt-dlp --no-update --skip-download --write-auto-subs --sub-langs "$langs" --sub-format "vtt" \
+  echo "==> 下载英文字幕: $vid" >&2
+  # 优先人工字幕，回退自动字幕
+  yt-dlp --no-update --skip-download \
+    --write-subs --write-auto-subs \
+    --sub-langs "en.*,en" --sub-format "vtt" \
     -o "$out_dir/%(id)s.%(ext)s" "$url" >/dev/null
 
-  local src_vtt="$out_dir/$vid.$src_lang.vtt"
-  local tgt_vtt=""
-  [[ -n "$tgt_lang" ]] && tgt_vtt="$out_dir/$vid.$tgt_lang.vtt"
+  local vtt=""
+  for cand in "$out_dir/$vid.en.vtt" "$out_dir/$vid.en-orig.vtt" "$out_dir/$vid.en-US.vtt" "$out_dir/$vid.en-GB.vtt"; do
+    if [[ -f "$cand" ]]; then vtt="$cand"; break; fi
+  done
+  [[ -n "$vtt" ]] || { echo "未找到英文字幕文件（尝试过 en/en-orig/en-US/en-GB）" >&2; exit 2; }
 
-  [[ -f "$src_vtt" ]] || { echo "没有找到源字幕: $src_vtt" >&2; exit 2; }
-  if [[ -n "$tgt_lang" && ! -f "$tgt_vtt" ]]; then
-    echo "没有找到目标字幕: $tgt_vtt" >&2
-    exit 2
-  fi
-
-  python3 - <<'PY' "$src_vtt" "$tgt_vtt" "$output" "$url" "$src_lang" "$tgt_lang" "$out_dir" "$vid" "$KEEP_INTERMEDIATE" "$title"
-import re, html, sys
+  python3 - "$vtt" "$output" "$url" "$vid" "$title" <<'PY'
+import json, re, sys
 from pathlib import Path
 
-src_vtt = Path(sys.argv[1])
-tgt_vtt = Path(sys.argv[2]) if sys.argv[2] else None
-output  = Path(sys.argv[3])
-url     = sys.argv[4]
-src_lang = sys.argv[5]
-tgt_lang = sys.argv[6]
-out_dir = Path(sys.argv[7])
-vid     = sys.argv[8]
-keep_intermediate = sys.argv[9] == '1'
-title   = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else vid
+vtt_path = Path(sys.argv[1])
+output = Path(sys.argv[2])
+url = sys.argv[3]
+vid = sys.argv[4]
+title = sys.argv[5]
 
 cue_re = re.compile(r'^(\d\d:\d\d:\d\d\.\d+) --> (\d\d:\d\d:\d\d\.\d+)')
 tag_re = re.compile(r'<[^>]+>')
@@ -121,10 +90,9 @@ def norm(s):
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-def parse_vtt(path: Path):
+def parse_vtt(path):
     lines = path.read_text(encoding='utf-8').splitlines()
-    cues = []
-    i = 0
+    cues, i = [], 0
     while i < len(lines):
         m = cue_re.match(lines[i])
         if not m:
@@ -147,16 +115,12 @@ def parse_vtt(path: Path):
     return cues
 
 def word_overlap(prev, cur, max_k=20):
-    # 返回 cur 开头与 prev 结尾重复的词数，用于消除 YouTube 自动字幕滚动上下文
-    if not prev or not cur:
-        return 0
-    if cur == prev or prev.endswith(cur):
-        return len(cur.split(' '))
+    if not prev or not cur: return 0
+    if cur == prev or prev.endswith(cur): return len(cur.split(' '))
     wp, wc = prev.split(' '), cur.split(' ')
     best = 0
     for k in range(1, min(len(wp), len(wc), max_k)+1):
-        if wp[-k:] == wc[:k]:
-            best = k
+        if wp[-k:] == wc[:k]: best = k
     return best
 
 def merge_text(prev, cur):
@@ -173,94 +137,121 @@ def merge_text(prev, cur):
     return prev + ' ' + cur
 
 def strip_leading_overlap(prev, cur, min_k=2):
-    # 分段起始时，从 cur 头部剥掉与 prev 尾部重复的滚动字幕
-    # 要求至少 min_k 个词才认为是重叠，避免单词偶然重合被误剥
     prev, cur = norm(prev), norm(cur)
-    if not prev or not cur:
-        return cur
+    if not prev or not cur: return cur
     wc = cur.split(' ')
     k = word_overlap(prev, cur)
-    if k < min_k:
-        return cur
-    if k >= len(wc):
-        return ''
+    if k < min_k: return cur
+    if k >= len(wc): return ''
     return ' '.join(wc[k:])
 
 def is_end(s):
-    return bool(re.search(r'[.!?。！？]$' , s.strip()))
+    return bool(re.search(r'[.!?。！？]$', s.strip()))
 
-src = parse_vtt(src_vtt)
-tgt = parse_vtt(tgt_vtt) if tgt_vtt else []
+cues = parse_vtt(vtt_path)
 
-pairs = []
-if tgt_vtt:
-    tgt_idx = 0
-    for s in src:
-        best = None; best_j = None
-        for j in range(max(0, tgt_idx-3), min(len(tgt), tgt_idx+8)):
-            z = tgt[j]
-            if z['start'] == s['start']:
-                best, best_j = z, j
-                break
-        if best is None:
-            for j in range(max(0, tgt_idx-3), min(len(tgt), tgt_idx+8)):
-                z = tgt[j]
-                overlap = not (z['end'] < s['start'] or z['start'] > s['end'])
-                if overlap:
-                    best, best_j = z, j
-                    break
-        tgt_idx = best_j if best_j is not None else tgt_idx
-        pairs.append((s['start'], s['end'], s['text'], best['text'] if best else ''))
-else:
-    pairs = [(s['start'], s['end'], s['text'], '') for s in src]
-
-merged = []
-cur = None
-for start, end, st, tt in pairs:
+merged, cur = [], None
+for c in cues:
     if cur is None:
-        cur = [start, end, st, tt]
+        cur = [c['start'], c['end'], c['text']]
         continue
-    cand_src = merge_text(cur[2], st)
-    cand_tgt = merge_text(cur[3], tt)
-    if len(cand_src) > 260 and is_end(cur[2]):
+    cand = merge_text(cur[2], c['text'])
+    if len(cand) > 260 and is_end(cur[2]):
         merged.append(tuple(cur))
-        # 新段起始时剥掉与上一段尾部重复的词，避免 YouTube 滚动字幕造成的重复开头
-        new_st = strip_leading_overlap(cur[2], st)
-        new_tt = strip_leading_overlap(cur[3], tt) if tt else tt
-        cur = [start, end, new_st, new_tt]
+        new_text = strip_leading_overlap(cur[2], c['text'])
+        cur = [c['start'], c['end'], new_text]
     else:
-        cur[1] = end
-        cur[2] = cand_src
-        cur[3] = cand_tgt
+        cur[1] = c['end']
+        cur[2] = cand
 if cur is not None:
     merged.append(tuple(cur))
 
 post = []
 for item in merged:
     if post and len(item[2]) < 40:
-        ps, pe, pen, ptgt = post[-1]
-        post[-1] = (ps, item[1], merge_text(pen, item[2]), merge_text(ptgt, item[3]))
+        ps, _, pen = post[-1]
+        post[-1] = (ps, item[1], merge_text(pen, item[2]))
     else:
         post.append(item)
 merged = post
 
-# 二次清理：连续两段之间若仍有词级重叠（跨越合并阈值边界的场景），从后段头部剥离
 cleaned = []
 for item in merged:
     if cleaned:
         prev = cleaned[-1]
-        new_src = strip_leading_overlap(prev[2], item[2])
-        new_tgt = strip_leading_overlap(prev[3], item[3]) if item[3] else item[3]
-        if new_src.strip():
-            cleaned.append((item[0], item[1], new_src, new_tgt))
+        new_text = strip_leading_overlap(prev[2], item[2])
+        if new_text.strip():
+            cleaned.append((item[0], item[1], new_text))
         else:
-            # 全部是重复内容，合并回上一段
-            cleaned[-1] = (prev[0], item[1], prev[2], prev[3])
+            cleaned[-1] = (prev[0], item[1], prev[2])
     else:
         cleaned.append(item)
 merged = cleaned
 
-lang_title = f"{src_lang} transcript" if not tgt_lang else f"{src_lang} / {tgt_lang} reading transcript"
+data = {
+    'video_id': vid,
+    'title': title,
+    'url': url,
+    'segments': [
+        {'i': idx, 'start': s, 'end': e, 'en': t, 'zh': ''}
+        for idx, (s, e, t) in enumerate(merged)
+    ],
+}
+output.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+
+# 删掉中间态 vtt
+vtt_path.unlink(missing_ok=True)
+
+print(output)
+print(f'segments={len(merged)}')
+PY
+
+  echo ""
+  echo "完成: $output"
+  echo ""
+  echo "下一步（由调用方 Agent 执行）："
+  echo "  1) 通读全部 segments，理解主题、语域、术语。"
+  echo "  2) 为每个 segment 的 zh 字段填入中文（信达雅，见 SKILL.md）。"
+  echo "  3) 保存后运行：$0 render $output"
+}
+
+cmd_render() {
+  local json="${1:-}"
+  [[ -z "$json" ]] && { echo "用法: $0 render <segments.json> [-o out.html]" >&2; exit 1; }
+  shift || true
+
+  local output=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output) output="$2"; shift 2 ;;
+      -*) echo "未知参数: $1" >&2; exit 1 ;;
+      *)  echo "未知参数: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  [[ -f "$json" ]] || { echo "未找到: $json" >&2; exit 2; }
+
+  python3 - "$json" "$output" <<'PY'
+import html, json, sys
+from pathlib import Path
+
+json_path = Path(sys.argv[1])
+output_arg = sys.argv[2]
+
+data = json.loads(json_path.read_text(encoding='utf-8'))
+segments = data.get('segments', [])
+title = data.get('title') or data.get('video_id') or 'Transcript'
+url   = data.get('url', '')
+vid   = data.get('video_id', 'transcript')
+
+has_zh = any((s.get('zh') or '').strip() for s in segments)
+missing = [s['i'] for s in segments if not (s.get('zh') or '').strip()] if has_zh else []
+
+if output_arg:
+    output = Path(output_arg)
+else:
+    output = json_path.parent / f'{vid}.reading.html'
+
 css = '''
 :root {
   --bg: #f6f2ea;
@@ -269,39 +260,77 @@ css = '''
   --muted: #6b655d;
   --rule: #e6ddd0;
   --accent: #8b6b43;
-  --shadow: 0 18px 45px rgba(27, 21, 14, 0.08);
+  --shadow: 0 6px 16px rgba(27, 21, 14, 0.05);
 }
-html, body { margin:0; padding:0; background:var(--bg); color:var(--text); font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif; line-height:1.75; }
+html, body { margin:0; padding:0; background:var(--bg); color:var(--text); font-family: ui-serif, Georgia, Cambria, "Times New Roman", serif; line-height:1.5; }
 * { box-sizing:border-box; }
-main { max-width: 920px; margin:0 auto; padding:64px 24px 120px; }
+main { max-width: 820px; margin:0 auto; padding:20px 18px 32px; }
 .header-card, .section { background:var(--paper); border:1px solid var(--rule); box-shadow:var(--shadow); }
-.header-card { padding:40px 44px 32px; margin-bottom:38px; }
+.header-card { padding:14px 18px 12px; margin-bottom:14px; }
 .kicker,.label,.meta,footer,.note { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-.kicker { text-transform:uppercase; letter-spacing:.12em; font-size:12px; color:var(--accent); margin-bottom:14px; }
-h1 { margin:0 0 10px; font-size:clamp(30px,4vw,44px); line-height:1.15; font-weight:600; }
-.subtitle { margin:0 0 18px; font-size:17px; color:var(--muted); font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-.meta { display:flex; flex-wrap:wrap; gap:10px 20px; padding-top:18px; border-top:1px solid var(--rule); font-size:13px; color:var(--muted); }
-.note { margin-top:18px; padding:14px 16px; background:#faf6ef; border-left:3px solid #ccb08a; font-size:14px; color:#5d554b; }
-.section-list { display:grid; gap:18px; }
-.section { padding:26px 30px 28px; }
-.time { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:12px; letter-spacing:.04em; color:var(--muted); margin-bottom:16px; }
-.label { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--accent); }
-.en { font-size:24px; line-height:1.55; font-weight:500; margin:6px 0 0; }
-.zh { font-size:18px; line-height:1.8; color:#35302b; margin:6px 0 0; }
-.single { font-size:22px; line-height:1.7; margin:8px 0 0; }
-.divider { height:1px; background:var(--rule); margin:18px 0 8px; }
-footer { margin-top:28px; text-align:center; color:var(--muted); font-size:13px; }
-@media (max-width:720px) {{ main {{ padding:24px 14px 72px; }} .header-card {{ padding:28px 22px 22px; }} .section {{ padding:20px 18px 20px; }} .en {{ font-size:20px; }} .zh {{ font-size:16px; }} .single {{ font-size:18px; }} }}
+h1 { margin:0 0 4px; font-size:clamp(18px,2.2vw,22px); line-height:1.25; font-weight:600; }
+.meta { display:flex; flex-wrap:wrap; gap:4px 14px; padding-top:6px; margin-top:4px; border-top:1px solid var(--rule); font-size:11px; color:var(--muted); }
+.note { margin-top:8px; padding:6px 10px; background:#faf6ef; border-left:2px solid #ccb08a; font-size:12px; color:#5d554b; }
+.section-list { display:grid; gap:6px; }
+.section { padding:8px 14px 10px; }
+.time { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:10px; letter-spacing:.03em; color:var(--muted); margin-bottom:4px; }
+.label { display:inline-block; font-size:9px; text-transform:uppercase; letter-spacing:.06em; color:var(--accent); margin-right:6px; vertical-align:2px; }
+.en { font-size:13.5px; line-height:1.45; font-weight:500; margin:1px 0 0; display:inline; }
+.zh { font-size:14px; line-height:1.6; color:#2b2825; margin:4px 0 0; font-family: "Songti SC", "Noto Serif SC", "Source Han Serif SC", "PingFang SC", "Hiragino Sans GB", ui-serif, serif; display:inline; }
+.line { margin:2px 0 0; }
+.single { font-size:14px; line-height:1.5; margin:2px 0 0; display:inline; }
+.divider { display:none; }
+footer { margin-top:14px; text-align:center; color:var(--muted); font-size:11px; }
+@media (max-width: 720px) {
+  main { padding:14px 10px 24px; }
+  .header-card { padding:12px 14px 10px; }
+  .section { padding:8px 12px 10px; }
+}
+@media print {
+  @page { size: A4; margin: 12mm 10mm; }
+  html, body { background:#fff; color:#000; }
+  main { max-width:none; padding:0; }
+  .header-card, .section { box-shadow:none; border-color:#bbb; }
+  .header-card { margin-bottom:8px; padding:8px 10px; }
+  .section-list { gap:4px; }
+  .section { padding:5px 10px 6px; page-break-inside:avoid; break-inside:avoid; }
+  .en { font-size:11pt; line-height:1.35; }
+  .zh { font-size:11pt; line-height:1.5; }
+  .single { font-size:11pt; line-height:1.35; }
+  .time { font-size:8pt; margin-bottom:2px; }
+  .label { font-size:7.5pt; }
+  h1 { font-size:14pt; }
+  .meta, .note, footer { font-size:8.5pt; }
+}
 '''
 
 parts = []
-for start, end, en, zh in merged:
-    if tgt_lang:
-        parts.append(f'''<section class="section"><div class="time">{html.escape(start)} — {html.escape(end)}</div><div class="label">{html.escape(src_lang)}</div><p class="en">{html.escape(en)}</p><div class="divider"></div><div class="label">{html.escape(tgt_lang)}</div><p class="zh">{html.escape(zh)}</p></section>''')
+for s in segments:
+    start = s.get('start', '')
+    end   = s.get('end', '')
+    en    = s.get('en', '') or ''
+    zh    = (s.get('zh') or '').strip()
+    if has_zh and zh:
+        parts.append(
+            '<section class="section">'
+            f'<div class="time">{html.escape(start)} — {html.escape(end)}</div>'
+            f'<p class="line"><span class="label">EN</span><span class="en">{html.escape(en)}</span></p>'
+            f'<p class="line"><span class="label">中文</span><span class="zh">{html.escape(zh)}</span></p>'
+            '</section>'
+        )
     else:
-        parts.append(f'''<section class="section"><div class="time">{html.escape(start)} — {html.escape(end)}</div><div class="label">{html.escape(src_lang)}</div><p class="single">{html.escape(en)}</p></section>''')
+        parts.append(
+            '<section class="section">'
+            f'<div class="time">{html.escape(start)} — {html.escape(end)}</div>'
+            f'<p class="line"><span class="label">EN</span><span class="single">{html.escape(en)}</span></p>'
+            '</section>'
+        )
 
-html_doc = f'''<!doctype html>
+note_html = ''
+if has_zh and missing:
+    note_html = f'<div class="note">注意：有 {len(missing)} 段未翻译（i={missing[:10]}{"..." if len(missing) > 10 else ""}），已回退为单语显示。</div>'
+
+doc = f'''<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -315,9 +344,11 @@ html_doc = f'''<!doctype html>
     <div class="header-card">
       <h1>{html.escape(title)}</h1>
       <div class="meta">
-        <span>Video: <a href="{url}">{url}</a></span>
-        <span>Segments: {len(merged)}</span>
+        <span>Video: <a href="{html.escape(url)}">{html.escape(url)}</a></span>
+        <span>Segments: {len(segments)}</span>
+        <span>Mode: {"bilingual" if has_zh else "english-only"}</span>
       </div>
+      {note_html}
     </div>
   </header>
   <div class="section-list">{''.join(parts)}</div>
@@ -325,29 +356,18 @@ html_doc = f'''<!doctype html>
 </body>
 </html>'''
 
-output.write_text(html_doc, encoding='utf-8')
-
-# 中间态: 默认删掉 vtt；如果 keep_intermediate 就额外保留一个 txt 摘要
-if keep_intermediate:
-    lines = []
-    for start, end, en, zh in merged:
-        lines.append(f'[{start} - {end}]')
-        lines.append(f'{src_lang.upper()}: {en}')
-        if tgt_lang:
-            lines.append(f'{tgt_lang}: {zh}')
-        lines.append('')
-    (out_dir / f'{vid}.reading.txt').write_text('\n'.join(lines), encoding='utf-8')
-else:
-    src_vtt.unlink(missing_ok=True)
-    if tgt_vtt:
-        tgt_vtt.unlink(missing_ok=True)
-
+output.write_text(doc, encoding='utf-8')
 print(output)
-print(f'segments={len(merged)}')
+
+# 渲染成功后清理中间态 segments.json，只保留最终 HTML
+try:
+    json_path.unlink()
+except Exception:
+    pass
 PY
 
   echo ""
-  echo "完成: $output"
+  echo "完成: 已渲染 HTML（中间态 segments.json 已清理）"
 }
 
 cmd_clean() {
@@ -364,15 +384,20 @@ cmd_clean() {
 check_deps
 sub="${1:-}"; shift || true
 case "$sub" in
-  list)   cmd_list  "$@" ;;
-  build)  cmd_build "$@" ;;
-  clean)  cmd_clean "$@" ;;
+  list)    cmd_list    "$@" ;;
+  prepare) cmd_prepare "$@" ;;
+  render)  cmd_render  "$@" ;;
+  clean)   cmd_clean   "$@" ;;
+  build)
+    echo "[提示] build 已废弃：请分两步使用 prepare（拉英文字幕）+ 由 Agent 翻译 zh + render（生成 HTML）。见 SKILL.md" >&2
+    cmd_prepare "$@"
+    ;;
   -h|--help|help|"")
     sed -n '2,24p' "$0"
     ;;
   *)
     echo "未知子命令: $sub" >&2
-    echo "用法: $0 {list|build|clean|help}" >&2
+    echo "用法: $0 {list|prepare|render|clean|help}" >&2
     exit 1
     ;;
 esac
