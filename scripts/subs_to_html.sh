@@ -9,6 +9,9 @@
 # 用法：
 #   ./subs_to_html.sh list    <youtube_url>
 #   ./subs_to_html.sh prepare <youtube_url> [-o segments.json]
+#   ./subs_to_html.sh view    <segments.json> [--missing]      # 紧凑英文视图，供通读/规划
+#   ./subs_to_html.sh apply   <segments.json> <trans.json>...  # 合并 zh 到 segments.json
+#   ./subs_to_html.sh status  <segments.json>                  # 翻译进度
 #   ./subs_to_html.sh render  <segments.json> [-o output.html]
 #   ./subs_to_html.sh clean   [<video_id>]
 #
@@ -370,6 +373,92 @@ PY
   echo "完成: 已渲染 HTML（中间态 segments.json 已清理）"
 }
 
+cmd_view() {
+  local json="${1:-}"
+  [[ -z "$json" ]] && { echo "用法: $0 view <segments.json> [--missing]" >&2; exit 1; }
+  [[ -f "$json" ]] || { echo "未找到: $json" >&2; exit 2; }
+  local only_missing="false"
+  [[ "${2:-}" == "--missing" ]] && only_missing="true"
+
+  python3 - "$json" "$only_missing" <<'PY'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+only_missing = sys.argv[2] == 'true'
+segs = data['segments']
+print(f"# {data.get('title','')}")
+print(f"# url: {data.get('url','')}")
+print(f"# segments: {len(segs)}  missing_zh: {sum(1 for s in segs if not (s.get('zh') or '').strip())}")
+print()
+for s in segs:
+    if only_missing and (s.get('zh') or '').strip():
+        continue
+    print(f"[{s['i']}] {s['start']} — {s['end']}")
+    print(s.get('en',''))
+    print()
+PY
+}
+
+cmd_apply() {
+  local json="${1:-}"; shift || true
+  [[ -z "$json" || $# -eq 0 ]] && { echo "用法: $0 apply <segments.json> <trans1.json> [trans2.json ...]" >&2; exit 1; }
+  [[ -f "$json" ]] || { echo "未找到: $json" >&2; exit 2; }
+  for f in "$@"; do
+    [[ -f "$f" ]] || { echo "未找到: $f" >&2; exit 2; }
+  done
+
+  python3 - "$json" "$@" <<'PY'
+import json, sys
+from pathlib import Path
+json_path = Path(sys.argv[1])
+data = json.loads(json_path.read_text(encoding='utf-8'))
+by_i = {s['i']: s for s in data['segments']}
+
+updated = 0
+for f in sys.argv[2:]:
+    trans = json.loads(Path(f).read_text(encoding='utf-8'))
+    if isinstance(trans, dict):
+        items = trans.items()
+    elif isinstance(trans, list):
+        items = ((it['i'], it.get('zh','')) for it in trans)
+    else:
+        raise SystemExit(f"unsupported translation shape in {f}")
+    for k, v in items:
+        i = int(k)
+        if i in by_i and (v or '').strip():
+            by_i[i]['zh'] = v
+            updated += 1
+
+json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+total = len(data['segments'])
+done = sum(1 for s in data['segments'] if (s.get('zh') or '').strip())
+print(f"applied={updated}  filled={done}/{total}  missing={total-done}")
+PY
+}
+
+cmd_status() {
+  local json="${1:-}"
+  [[ -z "$json" ]] && { echo "用法: $0 status <segments.json>" >&2; exit 1; }
+  [[ -f "$json" ]] || { echo "未找到: $json" >&2; exit 2; }
+  python3 - "$json" <<'PY'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+segs = data['segments']
+total = len(segs)
+missing = [s['i'] for s in segs if not (s.get('zh') or '').strip()]
+done = total - len(missing)
+print(f"title: {data.get('title','')}")
+print(f"segments: {total}")
+print(f"filled:   {done}")
+print(f"missing:  {len(missing)}")
+if missing:
+    preview = missing[:20]
+    tail = "..." if len(missing) > 20 else ""
+    print(f"missing_i: {preview}{tail}")
+PY
+}
+
 cmd_clean() {
   local vid="${1:-}"
   if [[ -n "$vid" ]]; then
@@ -386,6 +475,9 @@ sub="${1:-}"; shift || true
 case "$sub" in
   list)    cmd_list    "$@" ;;
   prepare) cmd_prepare "$@" ;;
+  view)    cmd_view    "$@" ;;
+  apply)   cmd_apply   "$@" ;;
+  status)  cmd_status  "$@" ;;
   render)  cmd_render  "$@" ;;
   clean)   cmd_clean   "$@" ;;
   build)
@@ -393,11 +485,11 @@ case "$sub" in
     cmd_prepare "$@"
     ;;
   -h|--help|help|"")
-    sed -n '2,24p' "$0"
+    sed -n '2,30p' "$0"
     ;;
   *)
     echo "未知子命令: $sub" >&2
-    echo "用法: $0 {list|prepare|render|clean|help}" >&2
+    echo "用法: $0 {list|prepare|view|apply|status|render|clean|help}" >&2
     exit 1
     ;;
 esac

@@ -60,7 +60,7 @@ Structure:
 
 The invoking Agent must:
 
-1. **Read all `en` segments end-to-end first.** Do not translate one-by-one before understanding the whole. Identify:
+1. **Read all `en` segments end-to-end first.** Do not translate one-by-one before understanding the whole. Prefer `scripts/subs_to_html.sh view <segments.json>` — it emits a compact EN-only view (about 1/3 the tokens of the raw JSON) suitable for a full read. Identify:
    - the topic and speaker(s)
    - the register (academic / conversational / promotional / technical)
    - recurring proper nouns, product names, jargon — decide a consistent Chinese rendering
@@ -70,10 +70,46 @@ The invoking Agent must:
    - **达 (fluent)** — read as native, idiomatic Chinese; break long English sentences into natural Chinese clauses; convert English discourse markers ("you know", "I mean", "so basically") into appropriate Chinese connectives or drop them
    - **雅 (elegant)** — match the source's register; keep metaphors alive where possible; do not over-formalize casual speech, do not over-colloquialize formal speech
 3. **Keep segment boundaries.** Do not merge or split segments across the JSON — the HTML aligns EN and 中文 per segment.
-4. **Write the JSON back to the same path.** Preserve `i`, `start`, `end`, `en` exactly. Only fill `zh`.
-5. **For long transcripts** (say, >80 segments), translate in batches but keep terminology consistent across batches. Consider maintaining a small glossary in your working memory as you go.
+4. **Choose your write mechanism by transcript size.** After `prepare`, look at `segments=N` from the output (or run `status`):
+   - **N ≤ ~40 segments (short video / short talk)** — one shot is fine. Read the file, translate all `zh` inline, and write the whole `segments.json` back with `Write`. Fewer tool calls, simpler.
+   - **N > ~40 segments (long talk, workshop, podcast)** — DO NOT rewrite the whole file with Write. The raw file is 30k–60k+ tokens; a single Write reproducing all the English is slow, hits output caps, and can be truncated. Use the **batch-and-apply** workflow below.
+   - Borderline (say 30–50): if the source is verbose (dense captions per segment), lean toward batching; if segments are short one-liners, one shot is still fine.
+
+   Whichever path you take, preserve `i`, `start`, `end`, `en` exactly. `apply` guarantees this; if you go one-shot, be careful not to alter them.
+5. **Batch size when batching.** ~25–35 segments per batch. Fewer → too many round-trips; more → single-response output gets uncomfortably large.
 
 If a segment's `en` is a partial phrase left over from caption merging (rare after cleanup), still translate it faithfully as a fragment — do not fabricate a complete sentence.
+
+### Stage 2.5 — batch-and-apply (write mechanism for long transcripts)
+
+**Only needed when N > ~40 segments.** For short transcripts, just Write the whole `segments.json` back after filling `zh` inline.
+
+For each batch, write a small file containing ONLY translations, keyed by segment index:
+
+```json
+{
+  "0": "……",
+  "1": "……",
+  "2": "……"
+}
+```
+
+Then merge it into `segments.json` with:
+
+```bash
+scripts/subs_to_html.sh apply <segments.json> <batch1.json> [batch2.json ...]
+```
+
+`apply` sets `zh` for every listed index and leaves `i` / `start` / `end` / `en` untouched. You can pass multiple batch files in a single call. It also accepts an array shape `[{"i": 0, "zh": "..."}, ...]` if that's more convenient.
+
+Check progress at any time with:
+
+```bash
+scripts/subs_to_html.sh status <segments.json>
+scripts/subs_to_html.sh view   <segments.json> --missing   # show only untranslated segments
+```
+
+**Why this workflow, in one line:** the raw `segments.json` is large, so streaming the whole file through a single Write is fragile; batches keep each tool call small, `apply` is idempotent, and `--missing` lets you resume cleanly if a batch is skipped.
 
 ### Stage 3 — render HTML
 
@@ -103,10 +139,12 @@ scripts/subs_to_html.sh clean            # remove all
 ## Recommended workflow when invoked
 
 1. If subtitle availability is unknown, run `list` first — but for English videos you can usually skip this and go straight to `prepare`.
-2. Run `prepare <url>`. The script auto-selects `en` / `en-orig` / `en-US` / `en-GB` and deletes the intermediate `.vtt`.
-3. Read the resulting `segments.json` in full. Plan terminology.
-4. Fill every segment's `zh` field. Write the JSON back.
-5. Run `render <segments.json>`.
+2. Run `prepare <url>`. The script auto-selects `en` / `en-orig` / `en-US` / `en-GB` and deletes the intermediate `.vtt`. Note the `segments=N` printed at the end.
+3. Read the transcript. For short ones you can just Read the JSON directly; for anything meatier, prefer `view <segments.json>` (compact, EN-only). Plan terminology and a small glossary.
+4. Fill translations, branching by size:
+   - **N ≤ ~40**: translate everything inline, then `Write` the whole `segments.json` back (one shot).
+   - **N > ~40**: translate in batches of ~30 segments. For each batch, write a `{"<i>": "<zh>", ...}` file (e.g. `/tmp/zh_batchN.json`) and run `apply <segments.json> <batch.json>`. Use `status` between batches and `view <segments.json> --missing` to resume.
+5. Run `render <segments.json>` — this also deletes the intermediate JSON, leaving only the final HTML.
 6. Report the final `.html` path to the user.
 
 ## What the prepare step does internally
