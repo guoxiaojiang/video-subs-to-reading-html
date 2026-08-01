@@ -9,9 +9,10 @@
 # 用法：
 #   ./subs_to_html.sh list    <youtube_url>
 #   ./subs_to_html.sh prepare <youtube_url> [-o segments.json]
-#   ./subs_to_html.sh view    <segments.json> [--missing]      # 紧凑英文视图，供通读/规划
-#   ./subs_to_html.sh apply   <segments.json> <trans.json>...  # 合并 zh 到 segments.json
-#   ./subs_to_html.sh status  <segments.json>                  # 翻译进度
+#   ./subs_to_html.sh view    <segments.json> [--missing] [--orig] [--diff]
+#   ./subs_to_html.sh apply   <segments.json> <trans.json>...  # 合并 zh + en 到 segments.json
+#   ./subs_to_html.sh status  <segments.json>
+#   ./subs_to_html.sh diff    <segments.json>                  # 查看 en_orig vs en 差异
 #   ./subs_to_html.sh render  <segments.json> [-o output.html]
 #   ./subs_to_html.sh clean   [<video_id>]
 #
@@ -31,7 +32,7 @@ check_deps() {
 }
 
 video_id_of() {
-  yt-dlp --no-update --print id "$1" | head -1
+  yt-dlp --cookies-from-browser chrome --no-update --print id "$1" | head -1
 }
 
 cmd_list() {
@@ -56,14 +57,14 @@ cmd_prepare() {
 
   local vid title
   vid=$(video_id_of "$url")
-  title=$(yt-dlp --no-update --print title "$url" | head -1)
+  title=$(yt-dlp --cookies-from-browser chrome --no-update --print title "$url" | head -1)
   local out_dir="$BASE_DIR/$vid"
   mkdir -p "$out_dir"
   [[ -z "$output" ]] && output="$out_dir/$vid.segments.json"
 
   echo "==> 下载英文字幕: $vid" >&2
   # 优先人工字幕，回退自动字幕
-  yt-dlp --no-update --skip-download \
+  yt-dlp --cookies-from-browser chrome --no-update --skip-download \
     --write-subs --write-auto-subs \
     --sub-langs "en.*,en" --sub-format "vtt" \
     -o "$out_dir/%(id)s.%(ext)s" "$url" >/dev/null
@@ -196,7 +197,7 @@ data = {
     'title': title,
     'url': url,
     'segments': [
-        {'i': idx, 'start': s, 'end': e, 'en': t, 'zh': ''}
+        {'i': idx, 'start': s, 'end': e, 'en_orig': t, 'en': t, 'zh': ''}
         for idx, (s, e, t) in enumerate(merged)
     ],
 }
@@ -375,26 +376,47 @@ PY
 
 cmd_view() {
   local json="${1:-}"
-  [[ -z "$json" ]] && { echo "用法: $0 view <segments.json> [--missing]" >&2; exit 1; }
+  [[ -z "$json" ]] && { echo "用法: $0 view <segments.json> [--missing] [--orig] [--diff]" >&2; exit 1; }
   [[ -f "$json" ]] || { echo "未找到: $json" >&2; exit 2; }
-  local only_missing="false"
-  [[ "${2:-}" == "--missing" ]] && only_missing="true"
+  local mode="en"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --missing) mode="missing" ; shift ;;
+      --orig)    mode="orig"    ; shift ;;
+      --diff)    mode="diff"    ; shift ;;
+      *) shift ;;
+    esac
+  done
 
-  python3 - "$json" "$only_missing" <<'PY'
+  python3 - "$json" "$mode" <<'PY'
 import json, sys
 from pathlib import Path
 data = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-only_missing = sys.argv[2] == 'true'
+mode = sys.argv[2]
 segs = data['segments']
+missing_zh = sum(1 for s in segs if not (s.get('zh') or '').strip())
+corrected_en = sum(1 for s in segs if (s.get('en_orig') or '') != (s.get('en') or ''))
 print(f"# {data.get('title','')}")
 print(f"# url: {data.get('url','')}")
-print(f"# segments: {len(segs)}  missing_zh: {sum(1 for s in segs if not (s.get('zh') or '').strip())}")
+print(f"# segments: {len(segs)}  missing_zh: {missing_zh}  en_corrected: {corrected_en}")
 print()
+
 for s in segs:
-    if only_missing and (s.get('zh') or '').strip():
+    en_orig = s.get('en_orig', '') or ''
+    en_val  = s.get('en', '') or ''
+    if mode == 'missing' and (s.get('zh') or '').strip():
+        continue
+    if mode == 'diff' and en_orig == en_val:
         continue
     print(f"[{s['i']}] {s['start']} — {s['end']}")
-    print(s.get('en',''))
+    if mode == 'diff':
+        print(f"  orig: {en_orig}")
+        print(f"     en: {en_val}")
+    elif mode == 'orig':
+        print(en_orig)
+    else:
+        print(en_val)
     print()
 PY
 }
@@ -414,25 +436,48 @@ json_path = Path(sys.argv[1])
 data = json.loads(json_path.read_text(encoding='utf-8'))
 by_i = {s['i']: s for s in data['segments']}
 
-updated = 0
+updated_zh = 0
+updated_en = 0
 for f in sys.argv[2:]:
     trans = json.loads(Path(f).read_text(encoding='utf-8'))
     if isinstance(trans, dict):
         items = trans.items()
     elif isinstance(trans, list):
-        items = ((it['i'], it.get('zh','')) for it in trans)
+        items = ((it['i'], it) for it in trans)
     else:
         raise SystemExit(f"unsupported translation shape in {f}")
     for k, v in items:
         i = int(k)
-        if i in by_i and (v or '').strip():
-            by_i[i]['zh'] = v
-            updated += 1
+        if i not in by_i:
+            continue
+        # Determine value shape:
+        #   string      -> zh only (backward compatible)
+        #   dict         -> may contain 'en' and/or 'zh'
+        #   list item    -> may contain 'en' and/or 'zh'
+        if isinstance(v, str):
+            if v.strip():
+                by_i[i]['zh'] = v
+                updated_zh += 1
+        elif isinstance(v, dict):
+            if 'en' in v and (v['en'] or '').strip():
+                by_i[i]['en'] = v['en']
+                updated_en += 1
+            if 'zh' in v and (v['zh'] or '').strip():
+                by_i[i]['zh'] = v['zh']
+                updated_zh += 1
+        else:
+            # fallback: try str()
+            s = str(v).strip()
+            if s:
+                by_i[i]['zh'] = s
+                updated_zh += 1
+
 
 json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
 total = len(data['segments'])
-done = sum(1 for s in data['segments'] if (s.get('zh') or '').strip())
-print(f"applied={updated}  filled={done}/{total}  missing={total-done}")
+done_zh = sum(1 for s in data['segments'] if (s.get('zh') or '').strip())
+done_en = sum(1 for s in data['segments'] if (s.get('en_orig') or '') != (s.get('en') or ''))
+print(f"applied_zh={updated_zh}  applied_en={updated_en}  filled_zh={done_zh}/{total}  corrected_en={done_en}")
 PY
 }
 
@@ -448,14 +493,47 @@ segs = data['segments']
 total = len(segs)
 missing = [s['i'] for s in segs if not (s.get('zh') or '').strip()]
 done = total - len(missing)
+en_corrected = sum(1 for s in segs if (s.get('en_orig') or '') != (s.get('en') or ''))
 print(f"title: {data.get('title','')}")
 print(f"segments: {total}")
 print(f"filled:   {done}")
 print(f"missing:  {len(missing)}")
+print(f"en_corrected: {en_corrected}")
 if missing:
     preview = missing[:20]
     tail = "..." if len(missing) > 20 else ""
     print(f"missing_i: {preview}{tail}")
+if en_corrected:
+    corrected_i = [s['i'] for s in segs if (s.get('en_orig') or '') != (s.get('en') or '')]
+    preview = corrected_i[:20]
+    tail = "..." if len(corrected_i) > 20 else ""
+    print(f"corrected_i: {preview}{tail}")
+PY
+}
+
+cmd_diff() {
+  local json="${1:-}"
+  [[ -z "$json" ]] && { echo "用法: $0 diff <segments.json>" >&2; exit 1; }
+  [[ -f "$json" ]] || { echo "未找到: $json" >&2; exit 2; }
+  python3 - "$json" <<'PY'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+segs = data['segments']
+total = len(segs)
+diffs = [(s['i'], s['start'], s['end'], s.get('en_orig','') or '', s.get('en','') or '')
+         for s in segs if (s.get('en_orig') or '') != (s.get('en') or '')]
+if not diffs:
+    print("(no en corrections — en_orig == en for all segments)")
+else:
+    print(f"# {data.get('title','')}")
+    print(f"# {len(diffs)}/{total} segments have en corrections")
+    print()
+    for i, start, end, orig, en in diffs:
+        print(f"[{i}] {start} — {end}")
+        print(f"  orig: {orig}")
+        print(f"     en: {en}")
+        print()
 PY
 }
 
@@ -479,17 +557,18 @@ case "$sub" in
   apply)   cmd_apply   "$@" ;;
   status)  cmd_status  "$@" ;;
   render)  cmd_render  "$@" ;;
+  diff)    cmd_diff    "$@" ;;
   clean)   cmd_clean   "$@" ;;
   build)
-    echo "[提示] build 已废弃：请分两步使用 prepare（拉英文字幕）+ 由 Agent 翻译 zh + render（生成 HTML）。见 SKILL.md" >&2
+    echo "[提示] build 已废弃：请分步使用 prepare（拉英文字幕）→ Agent 纠正 en → Agent 翻译 zh → render（生成 HTML）。见 SKILL.md" >&2
     cmd_prepare "$@"
     ;;
   -h|--help|help|"")
-    sed -n '2,30p' "$0"
+    sed -n '2,32p' "$0"
     ;;
   *)
     echo "未知子命令: $sub" >&2
-    echo "用法: $0 {list|prepare|view|apply|status|render|clean|help}" >&2
+    echo "用法: $0 {list|prepare|view|apply|status|diff|render|clean|help}" >&2
     exit 1
     ;;
 esac
